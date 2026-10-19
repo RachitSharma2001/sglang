@@ -979,6 +979,11 @@ class ModelConfig:
         ]:
             self.hf_config.architectures[0] = "GlmOcrForConditionalGenerationNextN"
 
+        if is_draft_model and self.hf_config.architectures[0] == "JinaOCRForCausalLM":
+            self.hf_config.architectures[0] = "JinaOCRForCausalLMNextN"
+            # The FastMTP draft has one attention layer; size its KV pool for it.
+            self.hf_text_config.num_hidden_layers = 1
+
         if (
             is_draft_model
             and self.hf_config.architectures[0] == "LongcatFlashForCausalLM"
