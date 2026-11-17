@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+from itertools import accumulate
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -81,45 +82,73 @@ _flashinfer_gated_delta_rule_decode = None
 _flashinfer_gated_delta_rule_mtp_bf16 = None
 
 
+def _flashinfer_checkpoint_plan(
+    *,
+    extend_lens: list[int],
+    track_mask: list[bool],
+    track_lens: list[int],
+    prefix_lens: list[int],
+    every_n_tokens: int,
+) -> tuple[list[int], list[int]]:
+    """Packed checkpoint starts, and the checkpoint row of each tracked off-grid sequence."""
+    cu_starts = list(accumulate((n // every_n_tokens for n in extend_lens), initial=0))
+    src = []
+    for row, tracked in enumerate(track_mask):
+        relative_len = track_lens[row] - prefix_lens[row]
+        if tracked and relative_len % every_n_tokens != 0:
+            src.append(cu_starts[row] + relative_len // every_n_tokens - 1)
+    return cu_starts, src
+
+
 def maybe_build_flashinfer_checkpoint_plan(
     forward_batch: ForwardBatch,
     forward_metadata: ForwardMetadata,
     device: str,
+    *,
+    use_host_lists: bool,
 ) -> None:
-    """Populate packed FlashInfer checkpoint metadata when tracking requires it."""
+    """Populate packed FlashInfer checkpoint metadata when tracking requires it.
+
+    ``use_host_lists`` reads the batch's host track metadata; otherwise the device
+    tensors are copied back, and each copy syncs the stream.
+    """
     if (
         forward_metadata.track_ssm_h_src is None
         or forward_metadata.track_ssm_h_src.numel() == 0
     ):
         return
 
-    checkpoint_every_n_tokens = mamba_cache_chunk_size()
-    extend_seq_lens = forward_batch.extend_seq_lens.to(device="cpu", dtype=torch.int64)
-    track_mask = forward_batch.mamba_track_mask.to(device="cpu", dtype=torch.bool)
-    relative_track_lens = forward_batch.mamba_track_seqlens.to(
-        device="cpu", dtype=torch.int64
-    ) - forward_batch.extend_prefix_lens.to(device="cpu", dtype=torch.int64)
+    every_n_tokens = mamba_cache_chunk_size()
+    if use_host_lists:
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        track_mask = forward_batch.mamba_prefill_track_mask_cpu
+        track_lens = forward_batch.mamba_track_seqlens_cpu
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
+    else:
+        extend_lens = forward_batch.extend_seq_lens.tolist()
+        track_mask = forward_batch.mamba_track_mask.tolist()
+        track_lens = forward_batch.mamba_track_seqlens.tolist()
+        prefix_lens = forward_batch.extend_prefix_lens.tolist()
 
-    checkpoint_counts = extend_seq_lens // checkpoint_every_n_tokens
-    checkpoint_cu_starts = torch.zeros(checkpoint_counts.numel() + 1, dtype=torch.int64)
-    checkpoint_cu_starts[1:] = torch.cumsum(checkpoint_counts, dim=0)
-
-    use_checkpoint = track_mask & (relative_track_lens % checkpoint_every_n_tokens != 0)
-    track_checkpoint_src = checkpoint_cu_starts[:-1][use_checkpoint] + (
-        relative_track_lens[use_checkpoint] // checkpoint_every_n_tokens - 1
+    cu_starts, src = _flashinfer_checkpoint_plan(
+        extend_lens=extend_lens,
+        track_mask=track_mask,
+        track_lens=track_lens,
+        prefix_lens=prefix_lens,
+        every_n_tokens=every_n_tokens,
     )
-    if track_checkpoint_src.numel() and track_checkpoint_src.min() < 0:
+    if src and min(src) < 0:
         raise ValueError("Tracked GDN state precedes the first FlashInfer checkpoint.")
-    assert track_checkpoint_src.numel() == forward_metadata.track_ssm_h_dst.numel()
+    assert len(src) == forward_metadata.track_ssm_h_dst.numel()
 
-    forward_metadata.track_ssm_h_src = track_checkpoint_src.to(
+    forward_metadata.track_ssm_h_src = torch.tensor(src, dtype=torch.int64).to(
         device, non_blocking=True
     )
-    forward_metadata.state_checkpoint_cu_starts = checkpoint_cu_starts.to(
-        device, non_blocking=True
-    )
-    forward_metadata.num_state_checkpoints = int(checkpoint_cu_starts[-1])
-    forward_metadata.state_checkpoint_every_n_tokens = checkpoint_every_n_tokens
+    forward_metadata.state_checkpoint_cu_starts = torch.tensor(
+        cu_starts, dtype=torch.int64
+    ).to(device, non_blocking=True)
+    forward_metadata.num_state_checkpoints = cu_starts[-1]
+    forward_metadata.state_checkpoint_every_n_tokens = every_n_tokens
 
 
 def _get_flashinfer_gdn_kernels():

@@ -835,7 +835,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
 
                 maybe_build_flashinfer_checkpoint_plan(
-                    forward_batch, self.forward_metadata, self.device
+                    forward_batch,
+                    self.forward_metadata,
+                    self.device,
+                    use_host_lists=self._has_cpu_prefill_track_metadata(forward_batch),
                 )
         self._init_prefill_conv_block_table(forward_batch)
 

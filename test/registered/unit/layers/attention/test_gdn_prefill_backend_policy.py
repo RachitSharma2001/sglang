@@ -1,3 +1,4 @@
+import random
 import unittest
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -381,7 +382,9 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         override = get_context().override_server_args(_mamba_cache_chunk_size=64)
         override.install()
         self.addCleanup(override.restore)
-        maybe_build_flashinfer_checkpoint_plan(forward_batch, metadata, "cpu")
+        maybe_build_flashinfer_checkpoint_plan(
+            forward_batch, metadata, "cpu", use_host_lists=False
+        )
 
         torch.testing.assert_close(
             metadata.state_checkpoint_cu_starts,
@@ -391,13 +394,101 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         self.assertEqual(metadata.num_state_checkpoints, 7)
         self.assertEqual(metadata.state_checkpoint_every_n_tokens, 64)
 
+    def _seed_chunk_size_64(self):
+        override = get_context().override_server_args(_mamba_cache_chunk_size=64)
+        override.install()
+        self.addCleanup(override.restore)
+
+    def test_host_lists_build_checkpoint_plan_without_device_tensors(self):
+        # No device tensors on the batch: touching one would raise.
+        forward_batch = SimpleNamespace(
+            extend_seq_lens_cpu=[63, 64, 65, 127, 128, 129],
+            mamba_prefill_track_mask_cpu=[False, True, True, True, True, True],
+            mamba_track_seqlens_cpu=[63, 64, 65, 127, 65, 129],
+            extend_prefix_lens_cpu=[0] * 6,
+        )
+        metadata = SimpleNamespace(
+            track_ssm_h_src=torch.empty(4),
+            track_ssm_h_dst=torch.empty(4),
+        )
+        self._seed_chunk_size_64()
+
+        maybe_build_flashinfer_checkpoint_plan(
+            forward_batch, metadata, "cpu", use_host_lists=True
+        )
+
+        torch.testing.assert_close(
+            metadata.state_checkpoint_cu_starts,
+            torch.tensor([0, 0, 1, 2, 3, 5, 7]),
+        )
+        torch.testing.assert_close(metadata.track_ssm_h_src, torch.tensor([1, 2, 3, 6]))
+        self.assertEqual(metadata.num_state_checkpoints, 7)
+        self.assertEqual(metadata.state_checkpoint_every_n_tokens, 64)
+
+    def test_host_and_device_inputs_build_identical_checkpoint_plans(self):
+        self._seed_chunk_size_64()
+        generator = random.Random(0)
+        for _ in range(200):
+            bs = generator.randint(1, 12)
+            prefix = [generator.choice([0, 64, 128, 1024]) for _ in range(bs)]
+            extend = [generator.randint(64, 2000) for _ in range(bs)]
+            mask = [generator.random() < 0.6 for _ in range(bs)]
+            track = [p + generator.randint(64, e) for p, e in zip(prefix, extend)]
+            forward_batch = SimpleNamespace(
+                extend_seq_lens_cpu=extend,
+                mamba_prefill_track_mask_cpu=mask,
+                mamba_track_seqlens_cpu=track,
+                extend_prefix_lens_cpu=prefix,
+                extend_seq_lens=torch.tensor(extend, dtype=torch.int64),
+                mamba_track_mask=torch.tensor(mask, dtype=torch.bool),
+                mamba_track_seqlens=torch.tensor(track, dtype=torch.int64),
+                extend_prefix_lens=torch.tensor(prefix, dtype=torch.int64),
+            )
+            num_off_grid = sum(
+                m and (t - p) % 64 != 0 for m, t, p in zip(mask, track, prefix)
+            )
+            results = []
+            for use_host_lists in (True, False):
+                metadata = SimpleNamespace(
+                    track_ssm_h_src=torch.empty(1),
+                    track_ssm_h_dst=torch.empty(num_off_grid),
+                )
+                maybe_build_flashinfer_checkpoint_plan(
+                    forward_batch, metadata, "cpu", use_host_lists=use_host_lists
+                )
+                results.append(metadata)
+            host, device = results
+            torch.testing.assert_close(host.track_ssm_h_src, device.track_ssm_h_src)
+            torch.testing.assert_close(
+                host.state_checkpoint_cu_starts, device.state_checkpoint_cu_starts
+            )
+            self.assertEqual(host.num_state_checkpoints, device.num_state_checkpoints)
+
+    def test_tracked_state_before_first_checkpoint_is_rejected(self):
+        forward_batch = SimpleNamespace(
+            extend_seq_lens_cpu=[128],
+            mamba_prefill_track_mask_cpu=[True],
+            mamba_track_seqlens_cpu=[10],
+            extend_prefix_lens_cpu=[0],
+        )
+        metadata = SimpleNamespace(
+            track_ssm_h_src=torch.empty(1), track_ssm_h_dst=torch.empty(1)
+        )
+        self._seed_chunk_size_64()
+        with self.assertRaises(ValueError):
+            maybe_build_flashinfer_checkpoint_plan(
+                forward_batch, metadata, "cpu", use_host_lists=True
+            )
+
     def test_decode_tracking_without_h_source_skips_checkpoint_plan(self):
         backend = object.__new__(GDNAttnBackend)
         backend.device = "cpu"
         backend.kernel_dispatcher = SimpleNamespace(extend_uses_state_checkpoints=True)
         metadata = SimpleNamespace(has_mamba_track_mask=True, track_ssm_h_src=None)
         forward_batch = SimpleNamespace(
-            forward_mode=SimpleNamespace(is_target_verify=lambda: False),
+            forward_mode=SimpleNamespace(
+                is_target_verify=lambda: False, is_extend=lambda: False
+            ),
             multi_item_delimiter_indices=None,
             mamba_track_mask=torch.tensor([True]),
             mamba_track_indices=torch.tensor([7]),
